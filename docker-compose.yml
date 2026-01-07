@@ -1,0 +1,10 @@
+# Docker Compose - Pipeline Only (connects to external Supabase)
+# No local PostgreSQL - uses DATABASE_URL from .env
+
+services:
+  pipeline:
+    build: .
+    env_file:
+      - .env
+    # Optional: run once and exit, or keep for debugging
+    # command: python btc_spot_pipeline.py

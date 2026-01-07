@@ -1,11 +1,6 @@
 pandas
 numpy
 requests
-matplotlib
-rich
 python-dotenv
-ccxt
-yfinance
-beautifulsoup4
-lxml
-git+https://github.com/asimov-academy/Asimov_TV_connector.git
+psycopg2-binary
+rich

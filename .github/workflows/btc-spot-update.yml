@@ -1,0 +1,26 @@
+name: BTC Spot Data Update
+
+on:
+  schedule:
+    - cron: '0 4,16 * * *'  # 05:00 and 17:00 Spain time (UTC+1)
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Run pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python btc_spot_pipeline.py
