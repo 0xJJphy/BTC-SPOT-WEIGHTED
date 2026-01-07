@@ -949,19 +949,35 @@ def main():
                     named_usd_datasets.append((name, df))
         except Exception as e:
             print(f"[{exch}] Error loading overlap from DB: {e}")
+
+    # 4. Fourth Pass: Filter everything to RECALC window to ensure consistency
+    print(f"\n=== Filtering data to window: {recalc_start_date.date()} onwards ===")
     
+    # Filter 'data' dictionary
+    for key in data:
+        if data[key] is not None and not data[key].empty:
+            data[key] = data[key][data[key]["timestamp"] >= recalc_start_date].copy()
+            
+    # Filter 'named_usd_datasets'
+    filtered_usd_datasets = []
+    for name, df in named_usd_datasets:
+        if df is not None and not df.empty:
+            df_filtered = df[df["timestamp"] >= recalc_start_date].copy()
+            if not df_filtered.empty:
+                filtered_usd_datasets.append((name, df_filtered))
+    named_usd_datasets = filtered_usd_datasets
+
     # Get date range for FX
     all_dfs = [df for df in data.values() if df is not None and not df.empty]
     if not all_dfs:
-        print("No data fetched!")
+        print("No data in current recalculation window!")
         return
     
-    min_date = min(d["timestamp"].min().date() for d in all_dfs)
-    max_date = max(d["timestamp"].max().date() for d in all_dfs)
-    
-    # Fetch FX rates
+    # Fetch FX rates starting exactly from our window
     print("\n=== Fetching FX Rates ===")
-    fx_df = fetch_usdkrw_timeseries(min_date.isoformat(), max_date.isoformat())
+    fx_start = recalc_start_date.date().isoformat()
+    fx_end = datetime.now(timezone.utc).date().isoformat()
+    fx_df = fetch_usdkrw_timeseries(fx_start, fx_end)
     
     # Calculate Coinbase Premium
     print("\n=== Calculating Coinbase Premium ===")
