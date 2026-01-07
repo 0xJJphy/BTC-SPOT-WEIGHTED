@@ -11,8 +11,12 @@ import time
 import requests
 import pandas as pd
 import numpy as np
+import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Tuple
+
+# Silence pandas SQLAlchemy warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pandas")
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -844,73 +848,107 @@ def main():
     data: Dict[str, pd.DataFrame] = {}
     named_usd_datasets: List[Tuple[str, pd.DataFrame]] = []
     
-    # Fetch data from all exchanges (INCREMENTAL)
-    print("\n=== Fetching Exchange Data (Incremental) ===")
+    data: Dict[str, pd.DataFrame] = {}
+    named_usd_datasets: List[Tuple[str, pd.DataFrame]] = []
+    
+    # 1. First Pass: Determine which dates need recalculation
+    print("\n=== Checking Database Status ===")
+    recalc_start_date = datetime.now(timezone.utc)
+    fetch_plan = []
+    
     for exch, sym, fn, kwargs in tasks:
+        last_ts = get_last_timestamp(exch, sym)
+        if last_ts is not None:
+            # Re-fetch from 1 day before last timestamp to finalize partial candles
+            start_date = last_ts - timedelta(days=1)
+            recalc_start_date = min(recalc_start_date, start_date)
+            fetch_plan.append((exch, sym, fn, kwargs, start_date))
+        else:
+            recalc_start_date = min(recalc_start_date, datetime.fromtimestamp(default_start_ms / 1000, tz=timezone.utc))
+            fetch_plan.append((exch, sym, fn, kwargs, None))
+
+    recalc_start_ms = to_ms(recalc_start_date)
+    print(f"Global recalculation starts from: {recalc_start_date.date()}")
+
+    # 2. Second Pass: Fetch new data or load recent history from DB
+    print("\n=== Syncing Exchange Data ===")
+    for exch, sym, fn, kwargs, start_date in fetch_plan:
         key = f"{exch}:{sym}"
         
-        # Check last timestamp in database
-        last_ts = get_last_timestamp(exch, sym)
-        
-        if last_ts is not None:
-            # Overlap: start from 1 day before the last timestamp to ensure 
-            # partial candles from previous runs (e.g. 5 PM) are updated with latest data.
-            start_date = last_ts - timedelta(days=1)
-            start_ms = to_ms(start_date)
-            days_behind = (datetime.now(timezone.utc) - last_ts).days
-            print(f"\n[{exch}] {sym}: Last data {last_ts.date()}, re-fetching from {start_date.date()} ({days_behind} days behind)...")
-        else:
-            # First run: fetch full history
-            start_ms = default_start_ms
-            print(f"\n[{exch}] {sym}: No existing data, fetching full history...")
-        
-        # We always want to fetch at least today's partial data, 
-        # so we only skip if for some reason we are way in the future.
-        if last_ts and (datetime.now(timezone.utc) - last_ts).total_seconds() < 3600: # Less than 1 hour since last fetch
-             # However, even if recently fetched, the user might want updates. 
-             # Let's keep it simple: always fetch if start_ms is in the past.
-             pass
-        
-        if start_ms > to_ms(datetime.now(timezone.utc) + timedelta(hours=24)):
-            print(f"[{exch}] {sym}: Already up to date!")
-            # Load existing data from DB for aggregation
-            try:
-                conn = get_db_connection()
-                df = pd.read_sql("""
-                    SELECT o.timestamp, o.open, o.high, o.low, o.close, o.volume,
-                           e.name as exchange, s.name as symbol
-                    FROM ohlcv_daily o
-                    JOIN exchanges e ON o.exchange_id = e.id
-                    JOIN symbols s ON o.symbol_id = s.id
-                    WHERE e.name = %s AND s.name = %s
-                    ORDER BY timestamp
-                """, conn, params=(exch, sym))
-                conn.close()
-                data[key] = df
-                if not df.empty and (sym.endswith("/USD") or sym.endswith("/USDT") or sym.endswith("/USDC")):
-                    named_usd_datasets.append((f"{exch} {sym}", df))
-            except Exception as e:
-                print(f"[{exch}] Error loading from DB: {e}")
-            continue
-        
-        try:
-            kwargs["start_ms"] = start_ms
-            df = fn(sym, **kwargs)
-            data[key] = df
+        if start_date:
+            days_behind = (datetime.now(timezone.utc) - start_date).days
+            print(f"\n[{exch}] {sym}: Fetching {days_behind} days (from {start_date.date()})...")
             
-            # Save to database
-            if df is not None and not df.empty:
-                upsert_ohlcv(df, exch, sym)
-                print(f"[{exch}] {sym} -> {len(df)} rows")
+            try:
+                # Always limit fetch to start_date
+                kwargs["start_ms"] = to_ms(start_date)
+                df = fn(sym, **kwargs)
+                data[key] = df
                 
-                # Track USD-like pairs for aggregation (exclude Upbit KRW)
+                if df is not None and not df.empty:
+                    upsert_ohlcv(df, exch, sym)
+                    print(f"[{exch}] {sym} -> {len(df)} new/updated rows")
+                    
+                    # Track USD-like pairs for aggregation (exclude Upbit KRW)
+                    if (sym.endswith("/USD") or sym.endswith("/USDT") or sym.endswith("/USDC")) and exch != "Upbit":
+                        name = f"{exch} {sym}"
+                        if exch == "Hyperliquid": name = "Hyperliquid BTC/USD"
+                        named_usd_datasets.append((name, df))
+            except Exception as e:
+                print(f"[{exch}] Error fetching {sym}: {e}")
+        else:
+            # First run for this exchange
+            print(f"\n[{exch}] {sym}: No existing data, fetching full history...")
+            try:
+                kwargs["start_ms"] = default_start_ms
+                df = fn(sym, **kwargs)
+                data[key] = df
+                if df is not None and not df.empty:
+                    upsert_ohlcv(df, exch, sym)
+                    if (sym.endswith("/USD") or sym.endswith("/USDT") or sym.endswith("/USDC")) and exch != "Upbit":
+                        name = f"{exch} {sym}"
+                        if exch == "Hyperliquid": name = "Hyperliquid BTC/USD"
+                        named_usd_datasets.append((name, df))
+            except Exception as e:
+                print(f"[{exch}] Error fetching {sym}: {e}")
+
+    # 3. Third Pass: For all exchanges, ensure we have the RECENT history for overlapping calculation
+    # (e.g., if we fetched MEXC but Binance was up to date, we still need Binance for the same dates)
+    print("\n=== Loading Missing Overlap Data from DB ===")
+    for exch, sym, _, _ in tasks:
+        key = f"{exch}:{sym}"
+        # If we already have enough data from the fetch, skip
+        if key in data and not data[key].empty and data[key]['timestamp'].min() <= recalc_start_date:
+            continue
+            
+        try:
+            conn = get_db_connection()
+            # ONLY load from recalc_start_date onwards
+            df = pd.read_sql("""
+                SELECT o.timestamp, o.open, o.high, o.low, o.close, o.volume,
+                        e.name as exchange, s.name as symbol
+                FROM ohlcv_daily o
+                JOIN exchanges e ON o.exchange_id = e.id
+                JOIN symbols s ON o.symbol_id = s.id
+                WHERE e.name = %s AND s.name = %s AND o.timestamp >= %s
+                ORDER BY timestamp
+            """, conn, params=(exch, sym, recalc_start_date))
+            conn.close()
+            
+            if not df.empty:
+                # Merge with existing fetched data if any
+                if key in data and not data[key].empty:
+                    df = pd.concat([df, data[key]], ignore_index=True).drop_duplicates(subset=['timestamp']).sort_values('timestamp')
+                
+                data[key] = df
                 if (sym.endswith("/USD") or sym.endswith("/USDT") or sym.endswith("/USDC")) and exch != "Upbit":
                     name = f"{exch} {sym}"
-                    if exch == "Hyperliquid":
-                        name = "Hyperliquid BTC/USD"  # Canonicalize
+                    if exch == "Hyperliquid": name = "Hyperliquid BTC/USD"
+                    # Add to aggregation list if not already there or update it
+                    named_usd_datasets = [d for d in named_usd_datasets if d[0] != name]
                     named_usd_datasets.append((name, df))
         except Exception as e:
-            print(f"[{exch}] Error fetching {sym}: {e}")
+            print(f"[{exch}] Error loading overlap from DB: {e}")
     
     # Get date range for FX
     all_dfs = [df for df in data.values() if df is not None and not df.empty]
